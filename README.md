@@ -24,7 +24,112 @@ Maven coordinates проекта (публикация в Maven Central не н�
 
 Для использования в другом локальном проекте сначала выполните `mvn install`.
 
-## Подключение и чат
+## Архитектура
+
+Зависимости направлены к прикладным контрактам:
+
+```text
+AnythingLlm (composition root)
+  ├─ WorkspaceService / ThreadService → application.port.AnythingLlmGateway
+  └─ RetrofitAnythingLlmGateway ────── implements ────────────────┘
+       ├─ RequestMapper / ResponseMapper
+       └─ Retrofit / OkHttp / Gson
+```
+
+| Пакет | Ответственность |
+| --- | --- |
+| `application.api` | Входные контракты `Workspaces`, `Threads` |
+| `application.dto` | Неизменяемые запросы и результаты на типах JDK |
+| `application.exception` | Проверяемые ошибки прикладной границы |
+| `application.port` | Порт внешнего сервиса, необходимый сценариям |
+| `application.service` | Проверка аргументов, точный поиск и правила выбора workspace |
+| `infrastructure.retrofit` | HTTP, авторизация, ресурсы, JSON, преобразование DTO |
+| Корневой пакет | `AnythingLlm` собирает граф объектов; прежний API сохраняет совместимость |
+
+`application` не импортирует инфраструктуру, Gson, Retrofit или OkHttp.
+Сервисы принимают выходной порт через конструктор и тестируются без сети.
+Отдельного domain-слоя нет: у этого SDK нет самостоятельной предметной модели,
+которой понадобился бы такой слой. Зависимости скомпилированных классов проверяет
+`OnionArchitectureTest` через JDK `jdeps`.
+
+Новые синхронные DTO находятся в `io.github.cherepavel.application.dto`, ошибки —
+в `io.github.cherepavel.application.exception`. Корневые `ChatRequest` и
+`ChatResponse` сохраняют прежний сериализуемый контракт низкоуровневого API;
+синхронный клиент использует отдельный `application.dto.ChatRequest` без Gson.
+Корневые `AnythingLlmApi` и `AnythingLlmClient` также сохранены для совместимости;
+реализация фабрики транспорта вынесена в инфраструктуру.
+
+## Синхронный клиент
+
+Прикладному коду достаточно типов SDK, `URI` и `Duration`:
+
+```java
+import io.github.cherepavel.AnythingLlm;
+import io.github.cherepavel.application.dto.ChatRequest;
+import java.net.URI;
+import java.time.Duration;
+
+try (var client = AnythingLlm.builder()
+        .serverUri(URI.create("http://127.0.0.1:3001"))
+        .apiKey(System.getenv("ANYTHINGLLM_API_KEY"))
+        .connectTimeout(Duration.ofSeconds(10))
+        .requestTimeout(Duration.ofMinutes(10))
+        .build()) {
+    var workspace = client.workspaces().findByName("СанПиН — вода");
+    var thread = client.threads().create(workspace.slug(), "Проверка анализа");
+    var response = client.threads().chat(workspace.slug(), thread.slug(),
+            new ChatRequest("Найди норматив для фторидов", ChatRequest.Mode.QUERY));
+    System.out.println(response.textResponse());
+}
+```
+
+`serverUri` задаёт HTTP(S)-адрес **без `/api/`**. Допускается префикс reverse proxy,
+например `https://example.org/anythingllm`: SDK добавляет `/api/`, затем пути `v1/`.
+Credentials, query и fragment запрещены. Ключ передаётся без `Bearer`, пробелов
+и управляющих символов. Настройки проверяются в `build()`; допустимые таймауты —
+от 1 мс до 2147483647 мс. По умолчанию connect timeout — 10 секунд,
+request timeout — 5 минут. Request timeout ограничивает весь HTTP-вызов, включая
+чтение тела, а не только ожидание очередного фрагмента ответа.
+
+Доступны `workspaces().list()`, `workspaces().get(slug)`,
+`workspaces().findByName(name)`, `workspaces().chat(slug, request)`,
+`threads().create(workspaceSlug, name)` и
+`threads().chat(workspaceSlug, threadSlug, request)`.
+Поиск имени учитывает регистр и не выбирает первое совпадение при дубликатах.
+Результаты — `Workspace`, `ThreadInfo`, `ChatReply` и списки DTO.
+`ChatReply.sources()` содержит `ChatSource` с title, text, id, documentId,
+chunkSource и url. Все исходные поля ответа, включая дополнительные идентификаторы,
+ссылки и metadata, доступны через `fields()` как глубоко неизменяемые
+`Map<String, Object>` / `List<?>` со строками, boolean, null и числами `BigDecimal`.
+Отсутствующие или null sources превращаются в пустой список.
+
+Все операции объявляют проверяемую `AnythingLlmException`:
+
+| Исключение | Причина |
+| --- | --- |
+| `TransportException` | Соединение, таймаут, ошибка чтения; исходная причина в `getCause()` |
+| `HttpException` | Неуспешный HTTP-код; `statusCode()` и безопасное имя `operation()` |
+| `ApiException` | Заполненный `error`, `type=abort` или `success=false` при успешном HTTP |
+| `InvalidResponseException` | Некорректный JSON, пустое тело, отсутствующие или неверные поля |
+| `WorkspaceNotFoundException` | Нет точного совпадения имени или пустой результат получения по slug |
+| `AmbiguousWorkspaceException` | Несколько точных совпадений имени |
+
+SDK не включает серверные сообщения ошибок, авторизацию и пользовательские запросы
+в собственные сообщения исключений. HTTP 404 остаётся `HttpException`.
+Текст ответа чата обязателен и не должен быть пустым. Транспортные ошибки и ошибки
+разбора сохраняют причину. Клиент закрывает тела ответов самостоятельно.
+
+Один клиент переиспользуется для нескольких операций. Он владеет только своим
+созданным внутри транспортом: `close()` отменяет активные вызовы, освобождает pool
+соединений и executor. Закрывайте клиент после окончания работы всех вызывающих
+потоков. После закрытия операции отклоняются с `IllegalStateException`.
+Синхронный клиент не принимает внешний транспорт и не затрагивает ресурсы
+отдельного низкоуровневого клиента. Автоматические повторы POST и перенаправления
+отключены, включая повторы после `503 Retry-After: 0`.
+Потоковые операции остаются отдельным низкоуровневым контрактом; SDK не собирает
+SSE в `ChatReply`.
+
+## Низкоуровневое подключение и чат
 
 Передавайте URL **до `/api/` включительно**; завершающий слеш необязателен.
 Ключ передаётся без префикса `Bearer`. Клиент добавляет его в заголовок
@@ -52,7 +157,7 @@ if (response.isSuccessful() && response.body() != null) {
 }
 ```
 
-Все методы возвращают Retrofit `Call<T>`: доступны `execute()`, `enqueue()`
+Все методы низкоуровневого `AnythingLlmApi` возвращают Retrofit `Call<T>`: доступны `execute()`, `enqueue()`
 и `cancel()`. Вызов `execute()` может выбросить `IOException`. Один `Call`
 исполняется один раз; для повторного запроса создайте новый или вызовите `clone()`.
 Сервис можно переиспользовать. По умолчанию read timeout составляет 5 минут;
